@@ -803,13 +803,16 @@ class Exporter:
             verbosity=verbosity,
             output_integer_quantized_tflite=self.args.int8,
             quant_type="per-tensor",  # "per-tensor" (faster) or "per-channel" (slower but more accurate)
-            custom_input_op_name_np_data_path=np_data,
+            #custom_input_op_name_np_data_path=np_data,
+            output_h5=True,
         )
         yaml_save(f / "metadata.yaml", self.metadata)  # add metadata.yaml
 
+        dataset=self.representative_dataset(tmp_file)
+        
         # Remove/rename TFLite models
         if self.args.int8:
-            tmp_file.unlink(missing_ok=True)
+            #tmp_file.unlink(missing_ok=True)
             for file in f.rglob("*_dynamic_range_quant.tflite"):
                 file.rename(file.with_name(file.stem.replace("_dynamic_range_quant", "_int8") + file.suffix))
             for file in f.rglob("*_integer_quant_with_int16_act.tflite"):
@@ -819,8 +822,46 @@ class Exporter:
         for file in f.rglob("*.tflite"):
             f.unlink() if "quant_with_int16_act.tflite" in str(f) else self._add_tflite_metadata(file)
 
-        return str(f), tf.saved_model.load(f, tags=None, options=None)  # load saved_model as Keras model
+        keras_model=tf.keras.models.load_model(f / 'yolov8n_float32.h5')
+        quantized_model=self.quantize(f,keras_model,dataset)
 
+        return str(f), quantized_model  # load saved_model as Keras model
+
+    def representative_dataset(self,dataset):
+        import numpy as np
+        def _data_gen():
+            data=np.load(dataset)
+            for data in data:
+                data=np.expand_dims(data,axis=0)
+                yield [data]
+        return _data_gen
+
+    def quantize(self,f,model,dataset):
+        import tensorflow as tf
+  
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.representative_dataset = dataset
+
+        ##Specify which nodes/layers to dequantize
+        custom_denylisted_ops=['LOGISTIC']
+        custom_denylisted_nodes=[]
+        debug_options=tf.lite.experimental.QuantizationDebugOptions(denylisted_ops=custom_denylisted_ops,
+                                                                denylisted_nodes=custom_denylisted_nodes)
+        debugger=tf.lite.experimental.QuantizationDebugger(
+            converter=converter,
+            debug_dataset=dataset,
+            debug_options=debug_options)
+        
+        debugger.run()
+
+        #save quantized model
+        selective_quantized_model = debugger.get_nondebug_quantized_model()
+        with open(f / 'quantized_model.tflite', 'wb') as file:
+            file.write(selective_quantized_model)
+        
+        return selective_quantized_model
+    
     @try_export
     def export_pb(self, keras_model, prefix=colorstr("TensorFlow GraphDef:")):
         """YOLOv8 TensorFlow GraphDef *.pb export https://github.com/leimao/Frozen_Graph_TensorFlow."""
